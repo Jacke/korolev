@@ -22,10 +22,10 @@ class Decoder[F[_]: Effect, A](upstream: Stream[F, A]) extends Stream[F, A] { se
   private def unsafeTakeBack(item: A): Unit =
     takenBackQueue = item :: takenBackQueue
 
-  def decode[S, B](default: => S)(f: (S, A) => (S, Action[A, B])): Stream[F, B] =
+  def decode[S, B](default: => S)(f: (S, A) => (S, Action[A, B])): Decoder[F, B] =
     decodeAsync(default)((s, a) => Effect[F].pure(f(s, a)))
 
-  def decodeAsync[S, B](default: => S)(f: (S, A) => F[(S, Action[A, B])]): Stream[F, B] =
+  def decodeAsync[S, B](default: => S)(f: (S, A) => F[(S, Action[A, B])]): Decoder[F, B] = Decoder(
     new Stream[F, B] {
       var state: S = default
       var finished = false
@@ -75,6 +75,7 @@ class Decoder[F[_]: Effect, A](upstream: Stream[F, A]) extends Stream[F, A] { se
       def cancel(): F[Unit] =
         self.cancel()
     }
+  )
 }
 
 object Decoder {

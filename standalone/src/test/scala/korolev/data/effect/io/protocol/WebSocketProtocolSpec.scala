@@ -3,14 +3,14 @@ package korolev.data.effect.io.protocol
 import korolev.Router
 import korolev.data.ByteVector
 import korolev.effect.Decoder
-import korolev.effect.io.protocol.RawWebSocketProtocol._
+import korolev.effect.io.protocol.WebSocketProtocol._
 import korolev.server.{Request, Response}
 import org.scalatest.{Assertion, FlatSpec, Matchers}
 
 import scala.annotation.tailrec
 import scala.util.Random
 
-class RawWebSocketProtocolSpec extends FlatSpec with Matchers {
+class WebSocketProtocolSpec extends FlatSpec with Matchers {
 
   final val SliceTestFramesNumber = 10
 

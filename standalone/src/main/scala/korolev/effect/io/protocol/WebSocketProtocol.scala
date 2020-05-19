@@ -19,7 +19,7 @@ import scala.annotation.{switch, tailrec}
 /**
   * @see https://tools.ietf.org/html/rfc6455
   */
-object RawWebSocketProtocol {
+object WebSocketProtocol {
 
   final val GUID = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11"
 
@@ -34,18 +34,49 @@ object RawWebSocketProtocol {
 
   final case class Intention(key: String)
 
-  sealed abstract class Frame(val opcode: Int)
+  sealed trait Frame {
+    def opcode: Int
+    def fin: Boolean
+  }
 
   object Frame {
-    case class Unspecified(fin: Boolean, override val opcode: Int, payload: ByteVector) extends Frame(opcode)
-    case class Continuation(payload: ByteVector, fin: Boolean) extends Frame(OpContinuation)
-    case class Binary(payload: ByteVector, fin: Boolean) extends Frame(OpBinary)
-    case class Text(payload: ByteVector, fin: Boolean) extends Frame(OpText) {
-      lazy val utf8: String = payload.utf8String
+    sealed trait Merged extends Frame {
+      def append(data: ByteVector, fin: Boolean): Merged
     }
-    case object ConnectionClose extends Frame(OpConnectionClose)
-    case object Ping extends Frame(OpPing)
-    case object Pong extends Frame(OpPong)
+
+    final case class Unspecified(fin: Boolean, opcode: Int, payload: ByteVector) extends Merged {
+      def append(data: ByteVector, fin: Boolean): Unspecified =
+        copy(fin = fin, payload = payload ++ data)
+    }
+    final case class Continuation(payload: ByteVector, fin: Boolean) extends Frame {
+      final val opcode = OpContinuation
+    }
+    final case class Binary(payload: ByteVector, fin: Boolean = true) extends Merged {
+      final val opcode = OpBinary
+      def append(data: ByteVector, fin: Boolean): Binary =
+        copy(fin = fin, payload = payload ++ data)
+    }
+    final case class Text(payload: ByteVector, fin: Boolean = true) extends Merged {
+      lazy val utf8: String = payload.utf8String
+      final val opcode = OpText
+      def append(data: ByteVector, fin: Boolean): Text =
+        copy(fin = fin, payload = payload ++ data)
+    }
+    case object ConnectionClose extends Merged {
+      final val opcode = OpConnectionClose
+      final val fin = true
+      def append(data: ByteVector, fin: Boolean): ConnectionClose.type = this
+    }
+    case object Ping extends Merged {
+      final val opcode = OpPing
+      final val fin = true
+      def append(data: ByteVector, fin: Boolean): Ping.type = this
+    }
+    case object Pong extends Merged {
+      final val opcode = OpPong
+      final val fin = true
+      def append(data: ByteVector, fin: Boolean): Pong.type = this
+    }
   }
 
   sealed trait DecodingState
@@ -137,6 +168,26 @@ object RawWebSocketProtocol {
     }
   }
 
+  /**
+    * https://tools.ietf.org/html/rfc6455#section-5.4
+    */
+  def mergeFrames(buffer: Option[Frame.Merged], incoming: Frame): (Option[Frame.Merged], Decoder.Action[Frame, Frame]) =
+    (buffer, incoming) match {
+      case (_, Frame.ConnectionClose | Frame.Ping | Frame.Pong) =>
+        // Control frames MAY be injected in
+        // the middle of a fragmented message.
+        (buffer, Decoder.Action.Push(incoming))
+      case (None, i) if i.fin => (None, Decoder.Action.Push(i))
+      case (None, i: Frame.Text) if !i.fin => (Some(i), Decoder.Action.TakeNext)
+      case (None, i: Frame.Binary) if !i.fin => (Some(i), Decoder.Action.TakeNext)
+      case (None, i: Frame.Unspecified) if !i.fin => (Some(i), Decoder.Action.TakeNext)
+      case (Some(buffer), i: Frame.Continuation) if !i.fin =>
+        (Some(buffer.append(i.payload, fin = false)), Decoder.Action.TakeNext)
+      case (Some(buffer), i: Frame.Continuation) if i.fin =>
+        (None, Decoder.Action.Push(buffer.append(i.payload, fin = true)))
+      case _ => throw new IllegalStateException(s"Fragmentation in WebSocket is invalid. Received $incoming after $buffer")
+    }
+
   def encodeFrame(frame: Frame, maybeMask: Option[Int]): ByteVector = frame match {
     case Frame.Pong | Frame.Ping | Frame.ConnectionClose => encodeFrame(fin = true, maybeMask, frame.opcode, ByteVector.empty)
     case Frame.Continuation(payload, fin) => encodeFrame(fin, maybeMask, frame.opcode, payload)
@@ -190,14 +241,19 @@ object RawWebSocketProtocol {
     )
   }
 
+  /**
+    * Upgrade Request/Response with raw bytes to WebSocket protocol and
+    * insert handshake headers. Fragments will be merged to single frames.
+    */
   def upgrade[F[_]: Effect](intention: Intention)
-                           (f: Request[Stream[F, Frame]] => F[Response[Stream[F, Frame]]]): Request[LazyBytes[F]] => F[Response[LazyBytes[F]]] = f
+                           (f: Request[Stream[F, Frame]] => F[Response[Stream[F, Frame.Merged]]]): Request[LazyBytes[F]] => F[Response[LazyBytes[F]]] = f
       .compose[Request[LazyBytes[F]]] { request =>
         val messages = Decoder(request.body.chunks.map(ByteVector(_)))
           .decode((ByteVector.empty, DecodingState.begin)) {
             case ((buffer, state), incoming) =>
               decodeFrames(buffer, state, incoming)
           }
+          .decode(Option.empty[Frame.Merged])(mergeFrames)
         request.copy(body = messages)
       }
       .andThen[F[Response[LazyBytes[F]]]] { responseF =>
@@ -206,6 +262,4 @@ object RawWebSocketProtocol {
           handshake(response, intention).copy(body = LazyBytes(upgradedBody, None))
         }
       }
-
-    case class UnsupportedOpcodeException(opcode: Int) extends Exception(s"Unsupported opcode: $opcode")
 }
